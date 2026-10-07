@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
 import argparse
+import ast
 import importlib.util
+import io
 import json
 import platform
 import re
@@ -11,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tokenize
 import types
 import typing
 from dataclasses import dataclass
@@ -582,6 +585,10 @@ def generate_v2_all(schema_dir: Path) -> None:
                 "--use-annotated",
                 "--use-union-operator",
                 "--disable-timestamp",
+                # 0.64 emits StrEnum by default. Keep Enum so the open-enum
+                # rewrite below still sees `class Name(Enum)` and the public
+                # enum types stay unchanged.
+                "--no-use-specialized-enum",
                 # Keep the generated file formatted deterministically so the
                 # checked-in artifact only changes when the schema does.
                 "--formatters",
@@ -589,7 +596,9 @@ def generate_v2_all(schema_dir: Path) -> None:
             ],
             cwd=sdk_root(),
         )
+    _inline_titled_literal_aliases(out_path, schema_dir)
     _preserve_inline_image_class_names(out_path)
+    _restore_previous_nullable_defaults(out_path)
     _require_nullable_field(out_path, "ChatgptAccount", r"email: str \| None")
     _require_nullable_field(
         out_path, "McpResourceReadTarget", r"link_id: Annotated\[\n(?:        .*\n)+    \]"
@@ -599,24 +608,210 @@ def generate_v2_all(schema_dir: Path) -> None:
     _preserve_thread_source_enum(out_path)
     _preserve_open_enum(out_path, "PlanType")
     _normalize_generated_timestamps(out_path)
+    run_python_module("ruff", ["format", str(out_path)], cwd=sdk_root())
+
+
+# 0.64 names the URL arm separately and emits the public name as a union
+# wrapper. Flatten that wrapper, then rename the URL arm back to the public
+# class so callers still construct ImageUserInput(url=...).
+_INLINE_IMAGE_VARIANTS = (
+    ("UrlUserInput", "ImageUserInput", "FileIdUserInput"),
+    ("ImageUrlContentItem", "InputImageContentItem", "FileIdContentItem"),
+    (
+        "ImageUrlFunctionCallOutputContentItem",
+        "InputImageFunctionCallOutputContentItem",
+        "FileIdFunctionCallOutputContentItem",
+    ),
+)
+
+
+def _class_spans(source: str) -> list[tuple[str, int, int]]:
+    matches = list(re.finditer(r"^class ([A-Za-z_][A-Za-z0-9_]*)\b", source, flags=re.MULTILINE))
+    spans: list[tuple[str, int, int]] = []
+    for index, match in enumerate(matches):
+        start = match.start()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
+        spans.append((match.group(1), start, end))
+    return spans
+
+
+def _class_text(source: str, name: str) -> str | None:
+    for class_name, start, end in _class_spans(source):
+        if class_name == name:
+            return source[start:end]
+    return None
+
+
+def _remove_class(source: str, name: str) -> str:
+    spans = [span for span in _class_spans(source) if span[0] == name]
+    if len(spans) != 1:
+        raise RuntimeError(f"Generated SDK does not have a unique {name} class")
+    _, start, end = spans[0]
+    return source[:start] + source[end:]
+
+
+def _replace_name_tokens(source: str, replacements: dict[str, str]) -> str:
+    """Replace generated class names without touching string literals."""
+    if not replacements:
+        return source
+    edits: list[tuple[tuple[int, int], tuple[int, int], str]] = []
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type == tokenize.NAME and token.string in replacements:
+            edits.append((token.start, token.end, replacements[token.string]))
+    if not edits:
+        return source
+    lines = source.splitlines(keepends=True)
+    for (start_row, start_col), (end_row, end_col), text in reversed(edits):
+        if start_row != end_row:
+            raise RuntimeError("Generated class name spanned multiple lines")
+        line = lines[start_row - 1]
+        lines[start_row - 1] = line[:start_col] + text + line[end_col:]
+    return "".join(lines)
+
+
+def _single_literal_alias(class_text: str) -> str | None:
+    header, separator, body = class_text.partition(":\n")
+    if not separator or "|" in header or "def " in body or "model_config" in body:
+        return None
+    # A titled RootModel whose Literal is not a single value is left untouched.
+    match = re.fullmatch(
+        r"class [A-Za-z_][A-Za-z0-9_]*\(\s*"
+        r"RootModel\[(Literal\[(?:\"[^\"]*\"|'[^']*')\])\]\s*\)",
+        header.strip(),
+        flags=re.DOTALL,
+    )
+    if match is None:
+        return None
+    literal = match.group(1)
+    if literal not in body:
+        return None
+    return literal
+
+
+def _schema_definition_names(schema_dir: Path) -> set[str]:
+    schema = json.loads(schema_bundle_path(schema_dir).read_text())
+    definitions = schema.get("definitions")
+    if not isinstance(definitions, dict):
+        raise RuntimeError(
+            "Schema bundle has no definitions dict; refusing to inline public classes"
+        )
+    return {name for name in definitions if isinstance(name, str)}
+
+
+def _inline_titled_literal_aliases(out_path: Path, schema_dir: Path) -> None:
+    """Collapse titled one-value enums back to Literal field annotations.
+
+    datamodel-code-generator 0.64 promotes an inline titled enum to its own
+    RootModel when ``--use-title-as-name`` is set. Those titles only exist so
+    Field(title=...) stays stable. Top-level schema definitions that are
+    themselves one-value enums remain classes.
+    """
+    source = out_path.read_text()
+    defined_names = _schema_definition_names(schema_dir)
+    mapping: dict[str, str] = {}
+    removals: list[tuple[int, int]] = []
+    for name, start, end in _class_spans(source):
+        if name in defined_names:
+            continue
+        literal = _single_literal_alias(source[start:end])
+        if literal is None:
+            continue
+        mapping[name] = literal
+        removals.append((start, end))
+    for start, end in reversed(removals):
+        source = source[:start] + source[end:]
+    out_path.write_text(_replace_name_tokens(source, mapping))
+
+
+def _is_variant_union_wrapper(class_text: str, variant_name: str, sibling_name: str) -> bool:
+    header = class_text.partition(":\n")[0]
+    compact = re.sub(r"\s+", "", header)
+    return (
+        f"(RootModel[{variant_name}|{sibling_name}])" in compact
+        or f"(RootModel[{sibling_name}|{variant_name}])" in compact
+    )
 
 
 def _preserve_inline_image_class_names(out_path: Path) -> None:
     """Keep the public class names used before ImageReference was introduced."""
     source = out_path.read_text()
-    stable_names = {
-        "UrlUserInput": "ImageUserInput",
-        "ImageUrlContentItem": "InputImageContentItem",
-        "ImageUrlFunctionCallOutputContentItem": "InputImageFunctionCallOutputContentItem",
-    }
-    for generated_name, stable_name in stable_names.items():
-        if source.count(f"class {generated_name}(") != 1:
-            raise RuntimeError(f"Generated SDK is missing a unique {generated_name} class")
-        if re.search(rf"\b{re.escape(stable_name)}\b", source):
+    for variant_name, stable_name, sibling_name in _INLINE_IMAGE_VARIANTS:
+        if source.count(f"class {variant_name}(") != 1:
+            raise RuntimeError(f"Generated SDK is missing a unique {variant_name} class")
+        wrapper = _class_text(source, stable_name)
+        if wrapper is not None and _is_variant_union_wrapper(wrapper, variant_name, sibling_name):
+            source = _remove_class(source, stable_name)
+            source = _replace_name_tokens(
+                source,
+                {stable_name: f"{variant_name} | {sibling_name}"},
+            )
+        elif wrapper is not None or re.search(rf"\b{re.escape(stable_name)}\b", source):
             raise RuntimeError(f"Generated SDK already defines {stable_name}")
-        source = re.sub(rf"\b{re.escape(generated_name)}\b", stable_name, source)
-
+        source = _replace_name_tokens(source, {variant_name: stable_name})
     out_path.write_text(source)
+
+
+def _annotation_is_nullable(node: ast.AST) -> bool:
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        return _annotation_is_nullable(node.left) or _annotation_is_nullable(node.right)
+    if isinstance(node, ast.Constant):
+        return node.value is None
+    if (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "Annotated"
+    ):
+        annotation = node.slice
+        if isinstance(annotation, ast.Tuple) and annotation.elts:
+            return _annotation_is_nullable(annotation.elts[0])
+        return _annotation_is_nullable(annotation)
+    return False
+
+
+def _drop_validate_default(source: str) -> str:
+    """Remove 0.64's validate_default flags so field annotations stay unchanged."""
+    source = re.sub(r"\n[ \t]*validate_default=True,\n", "\n", source)
+    source = source.replace(", validate_default=True", "")
+    source = source.replace("Field(validate_default=True)", "Field()")
+    return re.sub(
+        r"Annotated\[\s*((?:[^\[\]]|\[[^\]]*\])*)\s*,\s*Field\(\)\s*\]",
+        r"\1",
+        source,
+    )
+
+
+def _restore_previous_nullable_defaults(out_path: Path) -> None:
+    """Put back `= None` on nullable fields that 0.64 now treats as required.
+
+    The previous generator defaulted every nullable model field. Callers and
+    the public method layer still rely on that, except for the fields
+    `_require_nullable_field` strips afterwards. RootModel ``root`` fields
+    were already required and stay that way.
+    """
+    source = _drop_validate_default(
+        out_path.read_text().replace("Annotated[None, Field(None)]", "None")
+    )
+    tree = ast.parse(source)
+    lines = source.splitlines(keepends=True)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AnnAssign) or node.value is not None:
+            continue
+        if not isinstance(node.target, ast.Name) or node.target.id == "root":
+            continue
+        if node.end_lineno is None or not _annotation_is_nullable(node.annotation):
+            continue
+        line = lines[node.end_lineno - 1]
+        stripped = line.rstrip("\n")
+        if " = " in stripped:
+            continue
+        newline = "\n" if line.endswith("\n") else ""
+        lines[node.end_lineno - 1] = stripped + " = None" + newline
+    rewritten = "".join(lines)
+    try:
+        ast.parse(rewritten)
+    except SyntaxError as exc:
+        raise RuntimeError("Rewritten nullable defaults did not parse") from exc
+    out_path.write_text(rewritten)
 
 
 def _require_nullable_field(out_path: Path, class_name: str, field_pattern: str) -> None:
@@ -629,15 +824,25 @@ def _require_nullable_field(out_path: Path, class_name: str, field_pattern: str)
     if class_end == -1:
         class_end = len(source)
 
+    region = source[class_start:class_end]
+    already_required = re.search(
+        rf"^    {field_pattern}$",
+        region,
+        flags=re.MULTILINE,
+    )
     class_source, count = re.subn(
         rf"(^    {field_pattern}) = None$",
         r"\1",
-        source[class_start:class_end],
+        region,
         flags=re.MULTILINE,
     )
-    if count != 1:
-        raise RuntimeError(f"Generated {class_name} field did not have the expected nullable shape")
-    out_path.write_text(source[:class_start] + class_source + source[class_end:])
+    if count == 1:
+        out_path.write_text(source[:class_start] + class_source + source[class_end:])
+        return
+    # 0.64 already emits required nullable fields without a None default.
+    if count == 0 and already_required:
+        return
+    raise RuntimeError(f"Generated {class_name} field did not have the expected nullable shape")
 
 
 def _preserve_reasoning_effort_enum(out_path: Path) -> None:
